@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"bufio"
@@ -47,7 +47,7 @@ func (e DisconnectEvent) GetConn() net.Conn {
 	return e.conn
 }
 
-// StartServer starts the echo server on the given address
+// StartServer starts the message broker on the given address
 func StartServer(addr string) error {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {

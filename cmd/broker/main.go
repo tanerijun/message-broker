@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"os"
+
+	"github.com/tanerijun/message-broker/server"
 )
 
 func main() {
@@ -15,7 +17,7 @@ func main() {
 	port := os.Args[1]
 	addr := "0.0.0.0:" + port // bind to all interfaces
 
-	if err := StartServer(addr); err != nil {
+	if err := server.StartServer(addr); err != nil {
 		fmt.Println("Server error:", err)
 		os.Exit(1)
 	}
