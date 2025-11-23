@@ -2,100 +2,223 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
-func TestEchoServer(t *testing.T) {
+// Helper to read a line with timeout using connection deadline
+func readLineWithTimeout(conn net.Conn, timeout time.Duration) (string, error) {
+	conn.SetReadDeadline(time.Now().Add(timeout))
+	defer conn.SetReadDeadline(time.Time{}) // Clear deadline
+
+	scanner := bufio.NewScanner(conn)
+	if scanner.Scan() {
+		return scanner.Text(), nil
+	}
+
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	return "", fmt.Errorf("connection closed")
+}
+
+func TestMessageBroker(t *testing.T) {
 	// Start server in background on random port
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal("Failed to start listener:", err)
 	}
-	defer listener.Close()
 
 	serverAddr := listener.Addr().String()
 
 	// Start server in background
 	go runServer(listener)
 
-	t.Run("SingleClientEcho", func(t *testing.T) {
-		conn, err := net.Dial("tcp", serverAddr)
-		if err != nil {
-			t.Fatal("Failed to connect:", err)
-		}
-		defer conn.Close()
+	time.Sleep(10 * time.Millisecond)
 
-		scanner := bufio.NewScanner(conn)
+	t.Cleanup(func() {
+		listener.Close()
+	})
 
-		// Read welcome message
-		if !scanner.Scan() {
-			t.Fatal("Failed to read welcome message")
-		}
+	t.Run("SingleSubscriberReceivesMessage", func(t *testing.T) {
+		sub := mustConnect(t, serverAddr)
+		defer sub.Close()
 
-		// Send test message
-		conn.Write([]byte("hello\n"))
+		mustRead(t, sub) // CONNACK
+		mustWrite(t, sub, "SUBSCRIBE|topicA\n")
+		mustRead(t, sub) // SUBACK
 
-		// Read echo response
-		if !scanner.Scan() {
-			t.Fatal("Failed to read echo response")
-		}
-		response := strings.TrimSpace(scanner.Text())
-		if response != "hello" {
-			t.Errorf("Expected 'hello', got '%s'", response)
-		}
+		pub := mustConnect(t, serverAddr)
+		defer pub.Close()
 
-		// Send goodbye
-		conn.Write([]byte("goodbye\n"))
+		mustRead(t, pub) // CONNACK
+		mustWrite(t, pub, "PUBLISH|topicA|Hello\n")
+		mustRead(t, pub) // PUBACK
 
-		// Read goodbye response
-		if !scanner.Scan() {
-			t.Fatal("Failed to read goodbye response")
+		msg := mustRead(t, sub)
+		if !strings.Contains(msg, "Hello") {
+			t.Errorf("Expected 'Hello', got: %s", msg)
 		}
 	})
 
-	t.Run("MultipleClients", func(t *testing.T) {
-		// Connect two clients
-		conn1, err := net.Dial("tcp", serverAddr)
-		if err != nil {
-			t.Fatal("Client 1 failed to connect:", err)
-		}
-		defer conn1.Close()
+	t.Run("MultipleSubscribersSameTopic", func(t *testing.T) {
+		// Two subscribers to topicA
+		sub1 := mustConnect(t, serverAddr)
+		defer sub1.Close()
+		mustRead(t, sub1) // CONNACK
+		mustWrite(t, sub1, "SUBSCRIBE|topicA\n")
+		mustRead(t, sub1) // SUBACK
 
-		conn2, err := net.Dial("tcp", serverAddr)
-		if err != nil {
-			t.Fatal("Client 2 failed to connect:", err)
-		}
-		defer conn2.Close()
+		sub2 := mustConnect(t, serverAddr)
+		defer sub2.Close()
+		mustRead(t, sub2) // CONNACK
+		mustWrite(t, sub2, "SUBSCRIBE|topicA\n")
+		mustRead(t, sub2) // SUBACK
 
-		scanner1 := bufio.NewScanner(conn1)
-		scanner2 := bufio.NewScanner(conn2)
+		// Publish
+		pub := mustConnect(t, serverAddr)
+		defer pub.Close()
+		mustRead(t, pub) // CONNACK
+		mustWrite(t, pub, "PUBLISH|topicA|Broadcast\n")
+		mustRead(t, pub) // PUBACK
 
-		// Read welcome messages
-		scanner1.Scan()
-		scanner2.Scan()
+		// Both should receive
+		var wg sync.WaitGroup
+		wg.Add(2)
 
-		// Client 1 sends message
-		conn1.Write([]byte("client1\n"))
-		if !scanner1.Scan() {
-			t.Fatal("Client 1 failed to read response")
-		}
-		if strings.TrimSpace(scanner1.Text()) != "client1" {
-			t.Error("Client 1 did not receive correct echo")
-		}
-
-		// Client 2 sends message
-		conn2.Write([]byte("client2\n"))
-		if !scanner2.Scan() {
-			t.Fatal("Client 2 failed to read response")
-		}
-		if strings.TrimSpace(scanner2.Text()) != "client2" {
-			t.Error("Client 2 did not receive correct echo")
+		checkReceived := func(conn net.Conn, name string) {
+			defer wg.Done()
+			msg := mustRead(t, conn)
+			if !strings.Contains(msg, "Broadcast") {
+				t.Errorf("%s expected 'Broadcast', got: %s", name, msg)
+			}
 		}
 
-		// Disconnect both
-		conn1.Write([]byte("goodbye\n"))
-		conn2.Write([]byte("goodbye\n"))
+		go checkReceived(sub1, "Sub1")
+		go checkReceived(sub2, "Sub2")
+
+		wg.Wait()
 	})
+
+	t.Run("DifferentTopicsAreIsolated", func(t *testing.T) {
+		// Sub1 to topicA, Sub2 to topicB
+		sub1 := mustConnect(t, serverAddr)
+		defer sub1.Close()
+		mustRead(t, sub1) // CONNACK
+		mustWrite(t, sub1, "SUBSCRIBE|topicA\n")
+		mustRead(t, sub1) // SUBACK
+
+		sub2 := mustConnect(t, serverAddr)
+		defer sub2.Close()
+		mustRead(t, sub2) // CONNACK
+		mustWrite(t, sub2, "SUBSCRIBE|topicB\n")
+		mustRead(t, sub2) // SUBACK
+
+		// Publish to topicA
+		pub1 := mustConnect(t, serverAddr)
+		defer pub1.Close()
+		mustRead(t, pub1) // CONNACK
+		mustWrite(t, pub1, "PUBLISH|topicA|OnlyA\n")
+		mustRead(t, pub1) // PUBACK
+
+		// Only sub1 should receive
+		msg := mustRead(t, sub1)
+		if !strings.Contains(msg, "OnlyA") {
+			t.Errorf("Sub1 expected 'OnlyA', got: %s", msg)
+		}
+
+		// Publish to topicB
+		pub2 := mustConnect(t, serverAddr)
+		defer pub2.Close()
+		mustRead(t, pub2) // CONNACK
+		mustWrite(t, pub2, "PUBLISH|topicB|OnlyB\n")
+		mustRead(t, pub2) // PUBACK
+
+		// Only sub2 should receive
+		msg = mustRead(t, sub2)
+		if !strings.Contains(msg, "OnlyB") {
+			t.Errorf("Sub2 expected 'OnlyB', got: %s", msg)
+		}
+	})
+
+	t.Run("SubscriberJoinsLate", func(t *testing.T) {
+		// First subscriber
+		sub1 := mustConnect(t, serverAddr)
+		defer sub1.Close()
+		mustRead(t, sub1) // CONNACK
+		mustWrite(t, sub1, "SUBSCRIBE|topicX\n")
+		mustRead(t, sub1) // SUBACK
+
+		// First publish
+		pub1 := mustConnect(t, serverAddr)
+		defer pub1.Close()
+		mustRead(t, pub1) // CONNACK
+		mustWrite(t, pub1, "PUBLISH|topicX|First\n")
+		mustRead(t, pub1) // PUBACK
+
+		msg := mustRead(t, sub1)
+		if !strings.Contains(msg, "First") {
+			t.Errorf("Expected 'First', got: %s", msg)
+		}
+
+		// Second subscriber joins
+		sub2 := mustConnect(t, serverAddr)
+		defer sub2.Close()
+		mustRead(t, sub2) // CONNACK
+		mustWrite(t, sub2, "SUBSCRIBE|topicX\n")
+		mustRead(t, sub2) // SUBACK
+
+		// Second publish - both should receive
+		pub2 := mustConnect(t, serverAddr)
+		defer pub2.Close()
+		mustRead(t, pub2) // CONNACK
+		mustWrite(t, pub2, "PUBLISH|topicX|Second\n")
+		mustRead(t, pub2) // PUBACK
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		checkMsg := func(conn net.Conn, name string) {
+			defer wg.Done()
+			msg := mustRead(t, conn)
+			if !strings.Contains(msg, "Second") {
+				t.Errorf("%s expected 'Second', got: %s", name, msg)
+			}
+		}
+
+		go checkMsg(sub1, "Sub1")
+		go checkMsg(sub2, "Sub2")
+
+		wg.Wait()
+	})
+}
+
+func mustConnect(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal("Failed to connect:", err)
+	}
+	return conn
+}
+
+func mustRead(t *testing.T, conn net.Conn) string {
+	t.Helper()
+	line, err := readLineWithTimeout(conn, 200*time.Millisecond)
+	if err != nil {
+		t.Fatal("Failed to read:", err)
+	}
+	return line
+}
+
+func mustWrite(t *testing.T, conn net.Conn, data string) {
+	t.Helper()
+	_, err := conn.Write([]byte(data))
+	if err != nil {
+		t.Fatal("Failed to write:", err)
+	}
 }

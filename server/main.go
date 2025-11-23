@@ -13,7 +13,7 @@ func main() {
 	}
 
 	port := os.Args[1]
-	addr := ":" + port
+	addr := "0.0.0.0:" + port // bind to all interfaces
 
 	if err := StartServer(addr); err != nil {
 		fmt.Println("Server error:", err)
