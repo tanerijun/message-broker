@@ -48,23 +48,34 @@ func (e DisconnectEvent) GetConn() net.Conn {
 }
 
 // StartServer starts the message broker on the given address
-func StartServer(addr string) error {
+func StartServer(addr string, mode broker.BrokerMode, peerAddr string) error {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
-	fmt.Println("Server listening on", addr)
 
-	return runServer(listener)
+	modeStr := "PRIMARY"
+	if mode == broker.BackupMode {
+		modeStr = "BACKUP"
+	}
+	fmt.Printf("Server listening on %s (Mode: %s)\n", addr, modeStr)
+
+	return runServer(listener, mode, peerAddr)
 }
 
 // runServer runs the server with the given listener (useful for testing)
-func runServer(listener net.Listener) error {
+func runServer(listener net.Listener, mode broker.BrokerMode, peerAddr string) error {
 	// Channel for passing events from proxy to application logic
 	eventChan := make(chan Event, 100)
 
-	brk := broker.NewBroker()
+	brk := broker.NewBroker(mode, peerAddr)
+
+	// Start background routines
+	if mode == broker.BackupMode {
+		brk.StartHealthCheck()
+	}
+	brk.StartCleanupRoutine()
 
 	// Goroutine 1: Application Logic (Reactor)
 	go applicationLogic(eventChan, brk)
@@ -147,10 +158,14 @@ func handleMessage(event MessageEvent, brk *broker.Broker) {
 	// Handle the packet
 	brk.HandlePacket(packet, conn)
 
-	// If it's a PUBLISH packet, the publisher can disconnect
-	if packet.Type == protocol.PUBLISH {
+	// Close connection after certain packet types
+	switch packet.Type {
+	case protocol.PUBLISH:
 		fmt.Printf("Application: Publisher %s sent message and will disconnect\n", conn.RemoteAddr())
 		conn.Close()
+	case protocol.HEARTBEAT:
+		// Don't close - health check needs to read the HEARTBEAT_ACK response
+		// Connection will close naturally after response is sent
 	}
 }
 
